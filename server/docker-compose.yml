@@ -1,7 +1,6 @@
 services:
   oc2api:
-    image: oc2api
-    build: .
+    image: ghcr.io/terrywangt/oc2api:latest
     container_name: oc2api
     ports:
       - "8080:8080"
