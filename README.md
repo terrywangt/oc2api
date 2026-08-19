@@ -24,6 +24,25 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 
 你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
 
+### Cloudflare Worker 部署
+
+同一份代码也可以部署到 Cloudflare Worker（免费计划：10 万请求/天），出口走 Cloudflare 网络，与 Vercel（AWS）IP 段不同，可进一步扩大 IP 池多样性：
+
+1. 安装 wrangler：`npm i -g wrangler`（或直接用 `npx wrangler`）
+2. 认证：`wrangler login`，或用环境变量 `CLOUDFLARE_API_KEY` + `CLOUDFLARE_EMAIL`（Global API Key）
+3. 设置 API Key 为 Worker Secret（**不要写进 `wrangler.toml`**，避免密钥进入仓库泄露），然后部署：
+
+```bash
+echo "你的-api-key" | npx wrangler secret put API_KEY --name oc2api-worker-1
+echo "你的-api-key" | npx wrangler secret put API_KEY --name oc2api-worker-2
+npx wrangler deploy --name oc2api-worker-1   # 第一个 Worker
+npx wrangler deploy --name oc2api-worker-2   # 第二个 Worker（同样代码重复部署）
+```
+
+4. 部署完成得到 `https://<name>.<你的子域>.workers.dev`，即可当作 OpenAI 兼容端点使用（同样支持下面的 HTTP 代理接口）
+
+> 注意：Cloudflare Workers 出站走 Cloudflare 共享 IP 池，多个 Worker 的出口 IP 可能相同，适合作为「补充出口」，扩容主力仍是 Vercel 多项目。
+
 ## API
 
 兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
@@ -34,12 +53,39 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 | `/v1/models` 或 `/models`                     | GET  | 模型列表                          |
 | `/` 或 `/health`                             | GET  | 健康检查                          |
 | `/ip`                                        | GET  | 查询出口 IP                       |
+| `/proxy`                                     | 任意 | HTTP 代理接口（见下文）              |
 
 携带 API Key（如已配置）：
 
 ```
 Authorization: Bearer <api-key>
 ```
+
+## HTTP 代理接口
+
+提供与 AI 接口**同一套认证**的正向 HTTP 代理，目标请求从部署平台出口 IP 发出（Vercel / Cloudflare Worker 均可）。
+
+支持三种调用方式：
+
+```bash
+# 1. query 参数指定目标（推荐，最可靠）
+curl "https://<你的域名>/proxy?url=https%3A%2F%2Fapi.ipquery.io%2F" \
+  -H "Authorization: Bearer <api-key>"
+
+# 2. 路径中直接携带目标 URL（/proxy/ 后接完整 URL）
+curl "https://<你的域名>/proxy/https://api.ipquery.io/" \
+  -H "Authorization: Bearer <api-key>"
+
+# 3. 标准 HTTP 代理 absolute-form（curl -x 直达，目标 host 非本域名时自动识别）
+curl -x "https://<你的域名>:443" -U "user:<api-key>" https://api.ipquery.io/
+```
+
+特性：
+
+- **任意 HTTP 方法**（GET / POST / PUT / DELETE…），请求体与响应体完整透传（流式）
+- **认证**：`Authorization: Bearer <api-key>`、`X-API-Key`、`Proxy-Authorization: Basic`（密码等于 API_KEY）均可；未配置 `API_KEY` 时匿名
+- **安全**：仅允许 `http://` / `https://` 目标；自动拦截内网/本机地址（127.x、10.x、192.168.x、172.16-31.x、localhost 等），防止 SSRF
+- **限制**：平台不支持 TCP 隧道（CONNECT），因此仅代理 HTTP(S) 请求，不能当 VPN/SSH 隧道用
 
 ## 免费模型限制
 

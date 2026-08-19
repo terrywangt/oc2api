@@ -1,5 +1,9 @@
 const OC_VERSION = "1.15.13";
 const PROXY_VERSION = "v1.5.0";
+
+// 兼容多平台环境变量读取：Cloudflare Worker 通过 __OC_ENV__（env 参数）注入，
+// Vercel / Node 走 process.env
+const getEnv = (name) => globalThis.__OC_ENV__?.[name] ?? globalThis.process?.env?.[name];
 const ZEN_BASE_URL = "https://opencode.ai";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
@@ -59,6 +63,21 @@ async function handleRequest(request) {
 
 		if (request.method === "GET" && (path === "/v1/models" || path === "/models")) return modelsResponse();
 		if (request.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions")) return handleOpenAI(request);
+
+		// HTTP 代理接口（与 AI 接口同一套认证）
+		if (path === "/proxy" || path.startsWith("/proxy/")) {
+			const target =
+				url.searchParams.get("url") ||
+				(path.length > 7 && path.slice(1, 7) === "proxy" ? path.slice(7) : null);
+			if (!target) return jsonResponse({ error: { message: "Missing target. Use /proxy?url=<encoded-url>" } }, 400);
+			return handleProxy(request, target);
+		}
+
+		// 标准 HTTP 代理 absolute-form：GET http://target/... 直达本域名（curl -x 场景）
+		const rawUrl = request.url;
+		if ((rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) && url.hostname !== requestHost(request)) {
+			return handleProxy(request, rawUrl);
+		}
 
 		return jsonResponse({ error: { message: "Not found" } }, 404);
 	} catch (error) {
@@ -648,7 +667,7 @@ function stripThinkStreamText(text, state) {
 }
 
 function debugLog(label, payload) {
-	if (process.env.DEBUG !== "true") return;
+	if (getEnv("DEBUG") !== "true") return;
 	console.log(label, JSON.stringify(payload));
 }
 
@@ -658,13 +677,13 @@ function logZenRequest(requestId, format, model, stream, user, zenReq, messageCo
 
 function logZenResponse(payload) {
 	const { status } = payload;
-	if (!process.env.DEBUG && status < 400) return;
+	if (!getEnv("DEBUG") && status < 400) return;
 	console.log("[ZEN RES]", JSON.stringify(payload));
 }
 
 function logUpstreamBody(requestId, model, status, raw, zenError, firstChunk = false) {
 	const body = String(raw || "");
-	const shouldLog = process.env.DEBUG || Boolean(zenError) || status >= 400;
+	const shouldLog = getEnv("DEBUG") || Boolean(zenError) || status >= 400;
 	if (!shouldLog) return;
 
 	const payload = { requestId, model, status, firstChunk, chars: body.length };
@@ -688,11 +707,121 @@ function previewText(text, max = 800) {
 	return String(text || "").replace(/\s+/g, " ").slice(0, max);
 }
 
+// ---- HTTP 代理接口 ----
+// 用法：
+//   1. /proxy?url=<encoded-url>（任意方法，URL 在 query 参数）
+//   2. /proxy/https://target/...（URL 直接跟在路径后）
+//   3. 标准 HTTP 代理 absolute-form（curl -x https://<host> 直达，目标 host 非本域名时自动识别）
+// 认证与 AI 接口一致：Authorization: Bearer <API_KEY> / X-API-Key / Proxy-Authorization
+
+const PROXY_BLOCKED_HOSTS = /^(localhost|0\.0\.0\.0|::1|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i;
+
+function requestHost(request) {
+	return (request.headers.get("x-forwarded-host") || request.headers.get("host") || "")
+		.split(":")[0]
+		.toLowerCase();
+}
+
+function isProxyTargetAllowed(targetUrl) {
+	const url = new URL(targetUrl);
+	if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+	const host = url.hostname.toLowerCase();
+	if (PROXY_BLOCKED_HOSTS.test(host)) return false;
+	if (host.includes(":") && !host.startsWith("[")) return false; // 原始 IPv6 一律拒绝
+	return true;
+}
+
+async function handleProxy(request, target) {
+	let url;
+	try {
+		url = new URL(target);
+	} catch {
+		return jsonResponse({ error: { message: "Invalid target URL" } }, 400);
+	}
+
+	if (!isProxyTargetAllowed(url.toString())) {
+		return jsonResponse({ error: { message: "Target not allowed" } }, 403);
+	}
+
+	const headers = new Headers();
+	for (const [key, value] of request.headers) {
+		const lower = key.toLowerCase();
+		if (
+			lower === "host" ||
+			lower === "content-length" ||
+			lower === "connection" ||
+			lower === "keep-alive" ||
+			lower === "te" ||
+			lower === "trailer" ||
+			lower === "transfer-encoding" ||
+			lower === "upgrade" ||
+			lower === "proxy-authorization" ||
+			lower === "proxy-connection" ||
+			lower === "accept-encoding" ||
+			lower.startsWith("cf-") ||
+			lower.startsWith("x-vercel-") ||
+			lower.startsWith("x-forwarded-") ||
+			lower.startsWith("x-real-")
+		) {
+			continue;
+		}
+		headers.set(key, value);
+	}
+
+	const init = { method: request.method, headers, redirect: "follow" };
+	if (request.method !== "GET" && request.method !== "HEAD") {
+		init.body = request.body;
+		init.duplex = "half";
+	}
+
+	let upstream;
+	try {
+		upstream = await fetch(url.toString(), init);
+	} catch (error) {
+		console.log("[PROXY ERROR]", error?.message || error);
+		return jsonResponse({ error: { message: `Proxy upstream error: ${error?.message || "fetch failed"}` } }, 502);
+	}
+
+	const resHeaders = new Headers();
+	for (const [key, value] of upstream.headers) {
+		const lower = key.toLowerCase();
+		if (
+			lower === "content-encoding" ||
+			lower === "content-length" ||
+			lower === "transfer-encoding" ||
+			lower === "connection" ||
+			lower === "keep-alive"
+		) {
+			continue;
+		}
+		resHeaders.set(key, value);
+	}
+
+	return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
+}
+
 function authenticate(request) {
-	const apiKey = process.env.API_KEY;
+	const apiKey = getEnv("API_KEY");
 	if (!apiKey) return { user: "anonymous" };
 
-	const header = request.headers.get("authorization") || request.headers.get("x-api-key") || "";
+	let header =
+		request.headers.get("authorization") ||
+		request.headers.get("x-api-key") ||
+		request.headers.get("proxy-authorization") ||
+		"";
+
+	// 兼容代理客户端 Basic 认证（curl -x -U user:pass），密码等于 API_KEY 即通过
+	if (header.toLowerCase().startsWith("basic ")) {
+		try {
+			const decoded = atob(header.slice(6).trim());
+			const pass = decoded.includes(":") ? decoded.slice(decoded.indexOf(":") + 1) : decoded;
+			if (pass === apiKey) return { user: "user-proxy" };
+		} catch {
+			/* fallthrough */
+		}
+		return { error: openAIErrorResponse("Invalid API key", "authentication_error", 401) };
+	}
+
 	const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : header.trim();
 
 	if (token === apiKey) return { user: "user-default" };
@@ -773,3 +902,6 @@ function ocId(prefix) {
 	const rnd = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "").slice(0, 16);
 	return `${prefix}_${Date.now().toString(16)}${rnd}`;
 }
+
+// 供 Cloudflare Worker 等 Web 运行时直接复用（worker/index.js 入口）
+export { handleRequest };

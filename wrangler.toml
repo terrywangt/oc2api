@@ -1,0 +1,14 @@
+# Cloudflare Worker 部署配置（oc2api）
+# 部署命令：
+#   npx wrangler deploy --name oc2api-worker-1
+#   npx wrangler deploy --name oc2api-worker-2
+name = "oc2api-worker"
+main = "worker/index.js"
+compatibility_date = "2025-06-01"
+
+# API Key 请用 Secret 方式设置，不要写进本文件（避免密钥进入仓库）：
+#   echo "你的-api-key" | npx wrangler secret put API_KEY --name oc2api-worker-1
+#   echo "你的-api-key" | npx wrangler secret put API_KEY --name oc2api-worker-2
+
+# [observability]
+# enabled = true
