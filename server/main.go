@@ -11,8 +11,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +25,7 @@ import (
 )
 
 const (
-	ProxyVersion       = "v1.5.0"
+	ProxyVersion       = "v1.6.0"
 	OCVersion          = "1.15.13"
 	ZenBaseURL         = "https://opencode.ai"
 	ZenURL             = ZenBaseURL + "/zen/v1/chat/completions"
@@ -209,6 +211,29 @@ func authenticate(r *http.Request) (string, *apiError) {
 	}
 	if authHeader == "" {
 		authHeader = r.Header.Get("x-api-key")
+	}
+	if authHeader == "" {
+		authHeader = r.Header.Get("Proxy-Authorization")
+	}
+
+	// 兼容代理客户端 Basic 认证（curl -x -U user:pass），密码等于 API_KEY 即通过
+	if len(authHeader) > 6 && strings.EqualFold(authHeader[:6], "basic ") {
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(authHeader[6:]))
+		if err == nil {
+			s := string(decoded)
+			pass := s
+			if idx := strings.Index(s, ":"); idx >= 0 {
+				pass = s[idx+1:]
+			}
+			if pass == Cfg.APIKey {
+				return "user-proxy", nil
+			}
+		}
+		return "", &apiError{
+			message: "Invalid API key",
+			errType: "authentication_error",
+			status:  http.StatusUnauthorized,
+		}
 	}
 
 	token := authHeader
@@ -1191,6 +1216,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	SetCORSHeaders(w)
 
+	// 标准 HTTP 代理 absolute-form（curl -x 场景）：请求行是完整 URL 且目标不是本域
+	if r.URL.IsAbs() {
+		host := requestHost(r)
+		if host == "" || !strings.EqualFold(r.URL.Hostname(), host) {
+			ProxyResponse(w, r, r.URL.String())
+			return
+		}
+	}
+
 	path := strings.TrimRight(r.URL.Path, "/")
 	if path == "" {
 		path = "/"
@@ -1207,9 +1241,164 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		ModelsResponse(w, r)
 	case r.Method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions"):
 		HandleOpenAI(w, r, "")
+	case path == "/proxy" || strings.HasPrefix(path, "/proxy/"):
+		target := r.URL.Query().Get("url")
+		if target == "" {
+			// 用原始 RequestURI 提取，避免 Go URL 解析把路径中的 // 折叠（/proxy/https://x → https://x）
+			raw := r.RequestURI
+			if idx := strings.Index(raw, "?"); idx >= 0 {
+				raw = raw[:idx]
+			}
+			raw = strings.TrimPrefix(raw, "/proxy")
+			raw = strings.TrimPrefix(raw, "/")
+			target = raw
+		}
+		if target == "" {
+			JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Missing target. Use /proxy?url=<encoded-url>"}}, http.StatusBadRequest)
+			return
+		}
+		ProxyResponse(w, r, target)
 	default:
 		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Not found"}}, http.StatusNotFound)
 	}
+}
+
+// requestHost 返回本服务对外的主机名（优先 X-Forwarded-Host，其次 Host），不带端口、小写
+func requestHost(r *http.Request) string {
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	if idx := strings.Index(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+	return strings.ToLower(host)
+}
+
+// ---- HTTP 代理接口（与 JS 版 /proxy 对齐）----
+// 用法：
+//   1. /proxy?url=<encoded-url>（任意方法，URL 在 query 参数）
+//   2. /proxy/https://target/...（URL 直接跟在路径后）
+//   3. 标准 HTTP 代理 absolute-form（curl -x http://<host> 直达）
+// 认证与 AI 接口一致：Authorization: Bearer <API_KEY> / X-API-Key / Proxy-Authorization
+
+// proxyBlockedReqHeaders：转发上游时剔除的请求头（防 hop-by-hop 头泄漏与代理递归）
+var proxyBlockedReqHeaders = map[string]bool{
+	"host": true, "content-length": true, "connection": true, "keep-alive": true,
+	"te": true, "trailer": true, "transfer-encoding": true, "upgrade": true,
+	"proxy-authorization": true, "proxy-connection": true, "accept-encoding": true,
+	"cf-connecting-ip": true, "cf-ray": true, "cf-visitor": true, "cf-ipcountry": true,
+	"x-vercel-id": true, "x-vercel-forwarded-for": true, "x-vercel-deployment-url": true,
+	"x-forwarded-for": true, "x-forwarded-host": true, "x-forwarded-proto": true,
+	"x-forwarded-port": true, "x-real-ip": true,
+}
+
+// proxyBlockedResHeaders：回传客户端时剔除的响应头（body 由 io.Copy 流式透传，长度由 Go 自动处理）
+var proxyBlockedResHeaders = map[string]bool{
+	"content-length": true, "transfer-encoding": true, "connection": true,
+	"keep-alive": true, "content-encoding": true,
+}
+
+// isProxyTargetAllowed 校验目标 URL：仅 http/https，且拒绝内网/本机地址（SSRF 防护，与 JS 版一致）
+func isProxyTargetAllowed(u *url.URL) bool {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		return false // 原始 IPv6 一律拒绝
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return false
+		}
+		return true // 公网 IP 放行
+	}
+	// 域名形式：字符串前缀匹配（与 JS 正则等价）
+	if host == "localhost" ||
+		strings.HasPrefix(host, "127.") ||
+		strings.HasPrefix(host, "10.") ||
+		strings.HasPrefix(host, "192.168.") ||
+		strings.HasPrefix(host, "169.254.") {
+		return false
+	}
+	if strings.HasPrefix(host, "172.") {
+		parts := strings.Split(host, ".")
+		if len(parts) >= 2 {
+			if n, err := strconv.Atoi(parts[1]); err == nil && n >= 16 && n <= 31 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ProxyResponse 实现 /proxy 转发（认证、SSRF 校验、请求/响应头过滤、流式透传）
+func ProxyResponse(w http.ResponseWriter, r *http.Request, target string) {
+	if _, authErr := authenticate(r); authErr != nil {
+		writeAPIError(w, authErr)
+		return
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Invalid target URL"}}, http.StatusBadRequest)
+		return
+	}
+	if !isProxyTargetAllowed(u) {
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Target not allowed"}}, http.StatusForbidden)
+		return
+	}
+
+	var body io.Reader
+	if r.Method != "GET" && r.Method != "HEAD" {
+		body = r.Body
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), body)
+	if err != nil {
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Invalid target URL"}}, http.StatusBadRequest)
+		return
+	}
+	for k, vv := range r.Header {
+		if proxyBlockedReqHeaders[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		},
+		Transport: &http.Transport{DisableCompression: true},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		debugLog("[PROXY ERROR]", map[string]interface{}{"target": u.String(), "message": err.Error()})
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Proxy upstream error: " + err.Error()}}, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		if proxyBlockedResHeaders[strings.ToLower(k)] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 var ipv4Regex = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
@@ -1275,7 +1464,7 @@ func HealthResponse(w http.ResponseWriter) {
 	JSONResponse(w, map[string]interface{}{
 		"status":    "ok",
 		"version":   ProxyVersion,
-		"endpoints": []string{"/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/health", "/ip"},
+		"endpoints": []string{"/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/proxy", "/health", "/ip"},
 	}, http.StatusOK)
 }
 
@@ -1340,8 +1529,9 @@ func main() {
 
 	go sessionCleanupLoop()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", Handler)
+	// 不用 ServeMux：其 cleanPath 会把 /proxy/https://example.com 的 // 折叠成 301 重定向，
+	// 破坏 /proxy/<完整URL> 路径形式。直接挂 HandlerFunc 保留原始 RequestURI。
+	handler := http.HandlerFunc(Handler)
 
 	port := fmt.Sprintf("%d", Cfg.Port)
 	if Cfg.Port == 0 {
@@ -1354,7 +1544,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           mux,
+		Handler:           handler,
 		ReadTimeout:       ResolveTimeout(Cfg),
 		WriteTimeout:      0, // 关闭写超时，SSE 长流不被切
 		IdleTimeout:       ResolveTimeout(Cfg),
