@@ -28,7 +28,7 @@ docker compose up -d
 
 ## Serverless 部署
 
-本地/Docker 部署出口 IP 固定，建议部署到阿里云函数计算、腾讯云函数 等 Serverless 环境实现多出口 IP 轮询，规避速率限制。
+本地/Docker 部署出口 IP 固定，建议部署到阿里云函数计算、腾讯云函数 等 Serverless 环境实现多出口 IP 轮询，规避 IP 限制。
 
 ```bash
 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -trimpath -o main main.go
