@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: oc2api
+    runtime: node
+    plan: free
+    buildCommand: ""
+    startCommand: node server.js
+    envVars:
+      - key: API_KEY
+        sync: false
+      - key: DEBUG
+        sync: false
