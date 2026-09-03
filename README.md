@@ -20,6 +20,8 @@ OpenCode API 代理，支持 SSE 流式响应，可部署到 Vercel / Railway / 
 4. 在 **Environment Variables** 中添加：
     - `API_KEY` — API 密钥（留空则匿名访问）
     - `DEBUG` — 设为 `true` 开启调试日志（可选）
+    - `SHOW_REASONING` — 控制是否将模型思考内容（`reasoning_content`）转发给客户端。**默认留空 = 省流量模式（不转发思考内容）**，设为 `true` 则透传思考内容（可选）
+    - `REASONING_EFFORT` — 覆盖上游推理强度，可选 `low` / `medium` / `high` / `max`，**默认 `high`**（可选。设为 `low` 可让模型少想、减少上游 token 生成量与响应字节）
 5. 点击 **Deploy**，等待部署完成
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
@@ -48,6 +50,22 @@ Vercel 将每次函数调用的 **请求 + 响应** 数据都计入 Fast Origin 
 - **10 GB / 月 ≈ 10,000 次满输出**，或 **65,000 次重推理输出**
 
 超出 10 GB 后 **函数调用直接返回 503 停服**，无法追加购买。Hobby 档不可升级 Origin Transfer 额度。
+
+#### 如何节省 Origin Transfer（重点）
+
+SSE 流式输出是 Origin Transfer（Function → CDN）的大头，而推理模型的 `reasoning_content`（思考内容）往往占比巨大。**本项目默认开启省流量模式，不再把思考内容转发给客户端**，实测可将单次对话的出站体积普遍压低约 60~80%（思考 tokens 常占一次输出的绝大部分）。
+
+两个开关（部署时在 Vercel Environment Variables 配置）：
+
+| 环境变量 | 默认 | 取值 | 作用 |
+|---------|------|------|------|
+| `SHOW_REASONING` | 留空（关闭） | `true` 时开启 | 是否把 `reasoning_content` 思考内容转发给客户端。**默认关闭 = 省流量**；设为 `true` 则前端可看到思考过程，但出站流量回到原状 |
+| `REASONING_EFFORT` | `high` | `low`/`medium`/`high`/`max` | 控制上游模型思考强度。设为 `low` 让模型少想，进一步减少上游 token 生成量与响应字节（注意：这影响的是上游生成，不影响 Vercel 计费，但与关思考叠加省得最多） |
+
+**说明：**
+- 关闭思考转发省的是 **Vercel → 客户端** 的那段（Fast Origin Transfer 计费点），这是立竿见影的。
+- 上游（opencode.ai → Vercel）这段思考字节**无法省**：模型在生成时已产生，且无法"内部思考但不落字节"。`REASONING_EFFORT=low` 只能降低上游生成量、加快响应。
+- 已保留 `extractThinkBlocks` 逻辑：当 `SHOW_REASONING=true` 且全量响应时，仍会把 `content` 里的 `</think>` 思考抽回 `reasoning_content`，保证展示友好。
 
 #### Vercel 多项目 IP 扩展
 

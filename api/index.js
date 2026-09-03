@@ -10,6 +10,11 @@ const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
 const IMAGE_FALLBACK_MODEL = "mimo-v2.5-free"; // DeepSeek 不支持图片,带图请求路由到该带图模型
 
+// SHOW_REASONING: 是否将上游 reasoning_content 转发给客户端（默认 false = 省流量）
+// REASONING_EFFORT: 覆盖上游推理强度（low / medium / high / max，默认 high）
+const SHOW_REASONING = /^(true|1|yes)$/i.test(getEnv("SHOW_REASONING"));
+const REASONING_EFFORT = getEnv("REASONING_EFFORT") || "high";
+
 const userSessions = new Map();
 let cachedModels = null;
 
@@ -171,7 +176,6 @@ async function handleOpenAI(request) {
 	if (input.error) return input.error;
 
 	const { model, messages, stream, tools, tool_choice } = input.body;
-	const reasoningEffort = input.body.reasoning_effort ?? input.body.reasoningEffort;
 
 	const sessionId = getSession(auth.user);
 	const msgSummary = (messages || []).map((msg) => ({
@@ -186,7 +190,7 @@ async function handleOpenAI(request) {
 	const outgoingMessages = upstreamModel === model ? stripImagesForDeepSeek(messages) : messages;
 
 	const transformedMessages = injectReasoningContent(upstreamModel, outgoingMessages);
-	const zenReq = buildZenRequest(upstreamModel, transformedMessages, stream, tools, tool_choice, reasoningEffort, sessionId);
+	const zenReq = buildZenRequest(upstreamModel, transformedMessages, stream, tools, tool_choice, sessionId);
 	logZenRequest(requestId, "openai", model, stream, auth.user, zenReq, messages?.length || 0);
 
 	let upstream;
@@ -383,12 +387,12 @@ function injectReasoningContent(model, messages) {
 	return next;
 }
 
-function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEffort, sessionId) {
+function buildZenRequest(model, messages, stream, tools, toolChoice, sessionId) {
 	const reqBody = { model, messages, stream: !!stream };
 	// 按实际发送的模型判断:路由到图片模型时跳过 DS 专属的 reasoning_effort
+	const effort = ["low", "medium", "high", "max"].includes(REASONING_EFFORT) ? REASONING_EFFORT : "high";
 	if (deepSeekRegex.test(model)) {
-		if (reasoningEffort !== "high" && reasoningEffort !== "max") reasoningEffort = "high";
-		reqBody.reasoning_effort = reasoningEffort;
+		reqBody.reasoning_effort = effort;
 	}
 	if (tools?.length) reqBody.tools = tools;
 	if (toolChoice) reqBody.tool_choice = toolChoice;
@@ -546,11 +550,13 @@ function normalizeOpenAIFullData(data, model) {
 
 		const message = { ...choice.message };
 		normalizeReasoningField(message);
+		if (!SHOW_REASONING) delete message.reasoning_content;
 
 		if (typeof message.content === "string") {
-			const reasoning = extractThinkBlocks(message.content);
-			if (reasoning && message.reasoning_content == null) message.reasoning_content = reasoning;
-
+			if (SHOW_REASONING && message.reasoning_content == null) {
+				const reasoning = extractThinkBlocks(message.content);
+				if (reasoning) message.reasoning_content = reasoning;
+			}
 			const visibleContent = stripThinkBlocks(message.content);
 			if (visibleContent !== message.content) message.content = visibleContent;
 		}
@@ -587,6 +593,7 @@ function normalizeOpenAIStreamChoice(choice, contentStates) {
 
 	const delta = { ...choice.delta };
 	normalizeReasoningField(delta);
+	if (!SHOW_REASONING) delete delta.reasoning_content;
 
 	if (typeof delta.content === "string") {
 		const state = getThinkState(contentStates, choice.index ?? 0);
@@ -609,7 +616,7 @@ function normalizeReasoningField(target) {
 
 function extractThinkBlocks(text) {
 	const matches = [];
-	const pattern = /<think>([\s\S]*?)<\/think>/gi;
+	const pattern = / thinking([\s\S]*?)<\/think>/gi;
 	let match;
 	while ((match = pattern.exec(text)) !== null) {
 		const content = match[1].trim();
