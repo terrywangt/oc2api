@@ -1,7 +1,12 @@
 services:
   oc2api:
-    image: ghcr.io/terrywangt/oc2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.authfix
+    image: oc2api:authfix
     container_name: oc2api
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     restart: always

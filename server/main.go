@@ -1230,6 +1230,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		path = "/"
 	}
 
+	// 全局鉴权门：当 API_KEY 已设置（不为空）时，对所有路由进行密钥检查。
+	// 这样 /、/health、/ip、/proxy 等辅助接口也会被保护，避免泄露内部信息。
+	if Cfg.APIKey != "" {
+		if _, authErr := authenticate(r); authErr != nil {
+			writeAPIError(w, authErr)
+			return
+		}
+	}
+
 	switch {
 	case r.Method == "GET" && path == "/":
 		HealthResponse(w)
@@ -1496,11 +1505,27 @@ func LoadConfig() *Config {
 	data, err := os.ReadFile("config.yaml")
 	if err != nil {
 		log.Println("No config.yaml found, using defaults")
-		return cfg
-	}
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	} else if err := yaml.Unmarshal(data, cfg); err != nil {
 		log.Println("Failed to parse config.yaml:", err)
-		return cfg
+	}
+
+	// 环境变量覆盖（与 Vercel/Railway/Render README 对齐）。优先级高于 config.yaml。
+	if v := os.Getenv("API_KEY"); v != "" {
+		cfg.APIKey = v
+		log.Println("API_KEY loaded from API_KEY environment variable")
+	}
+	if v := os.Getenv("DEBUG"); v != "" {
+		cfg.Debug = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := os.Getenv("PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			cfg.Port = p
+		}
+	}
+	if v := os.Getenv("TIMEOUT_MS"); v != "" {
+		if t, err := strconv.Atoi(v); err == nil {
+			cfg.TimeoutMs = t
+		}
 	}
 
 	return cfg

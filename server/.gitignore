@@ -1,3 +1,4 @@
 main
 oc2api*
 .idea
+.env
