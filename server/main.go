@@ -1542,7 +1542,7 @@ func newZenHTTPClient() *http.Client {
 	// ResponseHeaderTimeout 覆盖「连接 + 等待响应头」，等价于 JS 的 FETCH_TIMEOUT_MS；
 	// 不设整体 Timeout，避免长流被硬切（body 流式读取无时长上限）。
 	return &http.Client{
-		Transport: &http.Transport{ResponseHeaderTimeout: ResolveTimeout(Cfg)},
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: ResolveTimeout(Cfg)},
 	}
 }
 
