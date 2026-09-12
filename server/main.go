@@ -32,7 +32,15 @@ const (
 	ZenModelsURL       = ZenBaseURL + "/zen/v1/models"
 	defaultTimeout     = 5 * time.Minute
 	ImageFallbackModel = "mimo-v2.5-free" // DeepSeek 不支持图片,带图请求路由到该带图模型
+
+	// 图片生成上游:免费、无需 key。OpenCode Zen 免费模型全部只输出文本(text-only),无生图能力,
+	// 因此 /v1/images/generations 转发到 Pollinations 免费图片服务。
+	PollinationsImageURL = "https://image.pollinations.ai/prompt/"
+	PollinationsUA       = "Mozilla/5.0 (compatible; oc2api-image/1.0)"
 )
+
+// imageCacheDir 存放本地暂存的生成图片(response_format=url 时供 GET /images/{id} 取用)
+const imageCacheDir = "/tmp/oc2api-images"
 
 type Config struct {
 	Port      int    `yaml:"port"`
@@ -1232,7 +1240,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 全局鉴权门：当 API_KEY 已设置（不为空）时，对所有路由进行密钥检查。
 	// 这样 /、/health、/ip、/proxy 等辅助接口也会被保护，避免泄露内部信息。
-	if Cfg.APIKey != "" {
+	publicImagePath := r.Method == "GET" && strings.HasPrefix(path, "/images/")
+	if Cfg.APIKey != "" && !publicImagePath {
 		if _, authErr := authenticate(r); authErr != nil {
 			writeAPIError(w, authErr)
 			return
@@ -1267,6 +1276,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ProxyResponse(w, r, target)
+	case r.Method == "POST" && (path == "/v1/images/generations" || path == "/images/generations"):
+		HandleImageGeneration(w, r)
+	case r.Method == "GET" && strings.HasPrefix(path, "/images/"):
+		serveCachedImage(w, r)
 	default:
 		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Not found"}}, http.StatusNotFound)
 	}
@@ -1282,6 +1295,193 @@ func requestHost(r *http.Request) string {
 		host = host[:idx]
 	}
 	return strings.ToLower(host)
+}
+
+// ---- 图片生成接口（/v1/images/generations）----
+// OpenAI Images API 兼容格式。上游: Pollinations 免费图片服务(无需 key)。
+// 支持参数:model, prompt, n, size, quality, response_format
+// response_format: "b64_json"(默认) 或 "url"(返回本服务 GET /images/{id} 可取)
+
+type imageGenRequest struct {
+	Model          string `json:"model"`
+	Prompt         string `json:"prompt"`
+	N              *int   `json:"n"`
+	Size           string `json:"size"`
+	Quality        string `json:"quality"`
+	ResponseFormat string `json:"response_format"`
+}
+
+func parseImageSize(s string) (w, h int) {
+	w, h = 512, 512
+	if s == "" {
+		return
+	}
+	parts := strings.SplitN(strings.ToLower(s), "x", 2)
+	if len(parts) == 2 {
+		if ww, err := strconv.Atoi(parts[0]); err == nil && ww > 0 {
+			w = ww
+		}
+		if hh, err := strconv.Atoi(parts[1]); err == nil && hh > 0 {
+			h = hh
+		}
+	}
+	// Pollinations 上游:宽高非 16 倍数会被缩放,但无报错,这里透传
+	return
+}
+
+func resolvePollinationsModel(reqModel string) string {
+	// 支持的上游模型别名:flux(默认)、turbo、turbo(旧)
+	switch strings.ToLower(reqModel) {
+	case "turbo", "stable-diffusion", "sd", "sdxl":
+		return "turbo"
+	case "flux", "":
+		return "flux"
+	default:
+		// 未知模型也走 flux(免费用)、不报错
+		return "flux"
+	}
+}
+
+func HandleImageGeneration(w http.ResponseWriter, r *http.Request) {
+	if _, authErr := authenticate(r); authErr != nil {
+		writeAPIError(w, authErr)
+		return
+	}
+
+	var req imageGenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAPIError(w, makeAPIError("Invalid request body: "+err.Error(), "invalid_request_error", http.StatusBadRequest))
+		return
+	}
+	if req.Prompt == "" {
+		writeAPIError(w, makeAPIError("prompt is required", "invalid_request_error", http.StatusBadRequest))
+		return
+	}
+
+	n := 1
+	if req.N != nil && *req.N > 0 {
+		n = *req.N
+		if n > 10 {
+			n = 10
+		}
+	}
+
+	respFormat := "b64_json"
+	if strings.EqualFold(req.ResponseFormat, "url") {
+		respFormat = "url"
+	}
+
+	wImg, hImg := parseImageSize(req.Size)
+	pollModel := resolvePollinationsModel(req.Model)
+
+	created := time.Now().Unix()
+	var data []map[string]interface{}
+
+	for i := 0; i < n; i++ {
+		seed := int(time.Now().UnixNano()%2147483647) + i
+		promptEncoded := url.PathEscape(req.Prompt)
+		genURL := fmt.Sprintf("%s%s?model=%s&width=%d&height=%d&seed=%d&nologo=true",
+			PollinationsImageURL, promptEncoded, pollModel, wImg, hImg, seed)
+
+		var imgData []byte
+		for attempt := 0; attempt < 2; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			imgReq, err := http.NewRequestWithContext(ctx, "GET", genURL, nil)
+			if err != nil {
+				cancel()
+				writeUpstreamError(w, err)
+				return
+			}
+			imgReq.Header.Set("User-Agent", PollinationsUA)
+			imgReq.Header.Set("Accept", "image/jpeg,image/png,*/*")
+
+			imgResp, err := zenHTTPClient.Do(imgReq)
+			if err != nil {
+				cancel()
+				writeUpstreamError(w, err)
+				return
+			}
+
+			imgData, err = io.ReadAll(io.LimitReader(imgResp.Body, 20*1024*1024)) // 最大 20MB
+			imgResp.Body.Close()
+			cancel()
+
+			if err != nil {
+				writeUpstreamError(w, err)
+				return
+			}
+			if imgResp.StatusCode == http.StatusOK {
+				break
+			}
+			if attempt == 0 && imgResp.StatusCode >= 500 {
+				debugLog("[IMAGE GEN RETRY]", map[string]interface{}{"seed": seed, "status": imgResp.StatusCode, "attempt": 1})
+				seed = int(time.Now().UnixNano()%2147483647) + i // 重试用新 seed
+				genURL = fmt.Sprintf("%s%s?model=%s&width=%d&height=%d&seed=%d&nologo=true",
+					PollinationsImageURL, promptEncoded, pollModel, wImg, hImg, seed)
+				continue
+			}
+			writeOpenAIError(w, fmt.Sprintf("Upstream image generation failed: HTTP %d", imgResp.StatusCode), "upstream_error", http.StatusBadGateway, "")
+			return
+		}
+		if imgData == nil {
+			writeOpenAIError(w, "Upstream image generation failed: empty response", "upstream_error", http.StatusBadGateway, "")
+			return
+		}
+
+		if respFormat == "url" {
+			// 写到本地暂存文件,返回本服务 URL
+			imgId := fmt.Sprintf("%d_%d_%d", created, i, seed)
+			imgPath := fmt.Sprintf("%s/%s.jpg", imageCacheDir, imgId)
+			if err := os.WriteFile(imgPath, imgData, 0644); err != nil {
+				writeUpstreamError(w, fmt.Errorf("write image cache: %w", err))
+				return
+			}
+			// 获取本服务 host(对外可达的),拼接 URL
+			host := requestHost(r)
+			proto := "https"
+			if r.TLS == nil {
+				if fwdProto := r.Header.Get("X-Forwarded-Proto"); fwdProto != "" {
+					proto = fwdProto
+				}
+			}
+			imgURL := fmt.Sprintf("%s://%s/images/%s.jpg", proto, host, imgId)
+			data = append(data, map[string]interface{}{"url": imgURL})
+			debugLog("[IMAGE GEN]", map[string]interface{}{"index": i, "seed": seed, "size": len(imgData), "url": imgURL})
+		} else {
+			b64 := base64.StdEncoding.EncodeToString(imgData)
+			data = append(data, map[string]interface{}{"b64_json": b64})
+			debugLog("[IMAGE GEN]", map[string]interface{}{"index": i, "seed": seed, "size": len(imgData), "format": "b64_json"})
+		}
+	}
+
+	JSONResponse(w, map[string]interface{}{
+		"created": created,
+		"data":    data,
+	}, http.StatusOK)
+}
+
+// GET /images/{id}.jpg —— response_format=url 时返回本地暂存图片
+func serveCachedImage(w http.ResponseWriter, r *http.Request) {
+	// 路径: /images/{filename}
+	name := strings.TrimPrefix(r.URL.Path, "/images/")
+	name = strings.TrimPrefix(name, "/")
+	if name == "" || strings.Contains(name, "/") || strings.Contains(name, "..") {
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Not found"}}, http.StatusNotFound)
+		return
+	}
+	imgPath := fmt.Sprintf("%s/%s", imageCacheDir, name)
+	imgData, err := os.ReadFile(imgPath)
+	if err != nil {
+		JSONResponse(w, map[string]interface{}{"error": map[string]interface{}{"message": "Image not found or expired"}}, http.StatusNotFound)
+		return
+	}
+	for k, v := range CORSHeaders {
+		w.Header().Set(k, v)
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	w.WriteHeader(http.StatusOK)
+	w.Write(imgData)
 }
 
 // ---- HTTP 代理接口（与 JS 版 /proxy 对齐）----
@@ -1473,7 +1673,7 @@ func HealthResponse(w http.ResponseWriter) {
 	JSONResponse(w, map[string]interface{}{
 		"status":    "ok",
 		"version":   ProxyVersion,
-		"endpoints": []string{"/v1/chat/completions", "/chat/completions", "/v1/models", "/models", "/proxy", "/health", "/ip"},
+		"endpoints": []string{"/v1/chat/completions", "/chat/completions", "/v1/images/generations", "/images/generations", "/v1/models", "/models", "/proxy", "/health", "/ip"},
 	}, http.StatusOK)
 }
 
@@ -1556,6 +1756,9 @@ func main() {
 
 	// 不用 ServeMux：其 cleanPath 会把 /proxy/https://example.com 的 // 折叠成 301 重定向，
 	// 破坏 /proxy/<完整URL> 路径形式。直接挂 HandlerFunc 保留原始 RequestURI。
+	// 创建图片缓存目录(用于 response_format=url 时暂存生成的图片)
+	os.MkdirAll(imageCacheDir, 0755)
+
 	handler := http.HandlerFunc(Handler)
 
 	port := fmt.Sprintf("%d", Cfg.Port)
