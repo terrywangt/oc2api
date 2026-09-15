@@ -1024,9 +1024,11 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 	if useImageModel {
 		upstreamModel = ImageFallbackModel
 	}
-	// 纯文字请求走 DeepSeek 时,把历史里的图片剥掉(DeepSeek 无法解析 image_url)。
+	// 仅当真正发给 DeepSeek 时才剥离历史图片(DeepSeek 无法解析 image_url)。
+	// 注意:修复前条件是 upstreamModel == model,对 mimo 等带图模型直接请求时
+	// 也会误剥图片,导致图片永远到不了 Zen。正确条件是判断最终上游模型。
 	transformedMessages := messages
-	if upstreamModel == model {
+	if deepSeekRegex.MatchString(upstreamModel) {
 		transformedMessages = stripImagesForDeepSeek(messages)
 	}
 	transformedMessages = injectReasoningContent(upstreamModel, transformedMessages)
