@@ -702,8 +702,9 @@ function authenticate(request) {
 
 // Zen 免费层要求 session ID 为 ses_ + 26 位小写十六进制
 function zenSessionID() {
-	const crypto = require('crypto');
-	return 'ses_' + crypto.randomBytes(13).toString('hex');
+	const bytes = new Uint8Array(13);
+	globalThis.crypto.getRandomValues(bytes);
+	return 'ses_' + [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function getSession(user) {
