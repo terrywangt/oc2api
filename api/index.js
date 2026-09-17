@@ -1,5 +1,5 @@
-const OC_VERSION = "1.15.13";
-const PROXY_VERSION = "v1.5.0";
+const OC_VERSION = "1.18.31";
+const PROXY_VERSION = "v1.6.1";
 
 // 兼容多平台环境变量读取：Cloudflare Worker 通过 __OC_ENV__（env 参数）注入，
 // Vercel / Node 走 process.env
@@ -836,11 +836,17 @@ function authenticate(request) {
 	return { error: openAIErrorResponse("Invalid API key", "authentication_error", 401) };
 }
 
+// Zen 免费层要求 session ID 为 ses_ + 26 位小写十六进制
+function zenSessionID() {
+	const crypto = require('crypto');
+	return 'ses_' + crypto.randomBytes(13).toString('hex');
+}
+
 function getSession(user) {
 	const now = Date.now();
 	const existing = userSessions.get(user);
 	if (!existing || now - existing.ts > 30 * 60 * 1000) {
-		const next = { id: ocId("ses"), ts: now };
+		const next = { id: zenSessionID(), ts: now };
 		userSessions.set(user, next);
 		return next.id;
 	}
