@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,8 +24,16 @@ import (
 )
 
 const (
-	ProxyVersion       = "v1.5.0"
-	OCVersion          = "1.15.13"
+	ProxyVersion = "v1.6.1"
+	// OCVersion 是 UA 中上报的 OpenCode CLI 版本。
+	// 2026-09-17 Zen 给免费层推理端点加了客户端校验(实测, 直连 https://opencode.ai/zen/v1/chat/completions):
+	//   1) UA 必须形如 opencode/<semver> 且版本 >= 1.17.0 —— 低于则 426 UpgradeRequired
+	//      ("OpenCode 1.17.0 or newer is required to use the free tier"),
+	//      非 opencode UA 则 403 FreeTierError ("can only be used from within OpenCode")
+	//   2) x-opencode-session 必须严格匹配 ses_[0-9a-f]{26}(26 位小写十六进制), 否则同样 403
+	// 旧值 1.15.13 低于门槛, 且 session 是自定义长 ID —— 两个条件都不满足, 全部请求 403。
+	// 上游抬高门槛时可用环境变量 OC_VERSION 覆盖, 无需改代码重新构建。
+	OCVersion          = "1.18.31"
 	ZenBaseURL         = "https://opencode.ai"
 	ZenURL             = ZenBaseURL + "/zen/v1/chat/completions"
 	ZenModelsURL       = ZenBaseURL + "/zen/v1/models"
@@ -155,6 +164,28 @@ func getThinkState(states map[int]*thinkState, key interface{}) *thinkState {
 	return states[idx]
 }
 
+// ocVersion 返回 UA 里使用的 OpenCode 版本, 允许 OC_VERSION 环境变量覆盖
+// (Zen 后续抬高最低版本要求时, 重建容器带上 OC_VERSION 即可)。
+func ocVersion() string {
+	if v := strings.TrimSpace(os.Getenv("OC_VERSION")); v != "" {
+		return v
+	}
+	return OCVersion
+}
+
+// zenUserAgent 构造 Zen 网关接受的 UA: opencode/<semver>(其余部分为真实 CLI 同款运行时标记)。
+func zenUserAgent() string {
+	return fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13", ocVersion())
+}
+
+// zenSessionID 生成 Zen 免费层要求的会话 ID: ses_ + 26 位小写十六进制。
+// 实测 ses_+24 位、ses_+28 位、不带前缀的 hex 全部 403。
+func zenSessionID() string {
+	b := make([]byte, 13)
+	cryptorand.Read(b)
+	return "ses_" + hex.EncodeToString(b)
+}
+
 func ocId(prefix string) string {
 	bytes := make([]byte, 12)
 	cryptorand.Read(bytes)
@@ -176,7 +207,7 @@ func getSession(user string) string {
 			return s.id
 		}
 	}
-	s := &session{id: ocId("ses"), ts: now}
+	s := &session{id: zenSessionID(), ts: now}
 	UserSessions.Store(user, s)
 	return s.id
 }
@@ -379,7 +410,7 @@ func fetchZenModels() ([]map[string]interface{}, error) {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
-	req.Header.Set("User-Agent", fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13", OCVersion))
+	req.Header.Set("User-Agent", zenUserAgent())
 
 	started := time.Now()
 	resp, err := zenHTTPClient.Do(req)
@@ -697,7 +728,7 @@ func buildZenRequest(model string, messages, tools []interface{}, toolChoice int
 	headers := map[string]string{
 		"Content-Type":       "application/json",
 		"Authorization":      "Bearer public",
-		"User-Agent":         fmt.Sprintf("opencode/%s ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13", OCVersion),
+		"User-Agent":         zenUserAgent(),
 		"x-opencode-client":  "desktop",
 		"x-opencode-project": "global",
 		"x-opencode-request": ocId("msg"),
