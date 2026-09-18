@@ -2055,8 +2055,15 @@ func LoadConfig() *Config {
 		ZenBaseURL = strings.TrimRight(v, "/")
 		log.Println("ZEN_BASE_URL overridden to", ZenBaseURL)
 	}
-	ZenURL = ZenBaseURL + "/zen/v1/chat/completions"
-	ZenModelsURL = ZenBaseURL + "/zen/v1/models"
+	// ZEN_PATH_PREFIX: Zen 官方端点在 /zen/v1/...；自建 bridge/代理直接暴露 /v1/...。
+	// 默认 "/zen"（直连 opencode.ai）；指向本地 bridge 时设 ZEN_PATH_PREFIX=""。
+	zenPathPrefix := "/zen"
+	if v, ok := os.LookupEnv("ZEN_PATH_PREFIX"); ok {
+		zenPathPrefix = strings.TrimRight(v, "/")
+		log.Println("ZEN_PATH_PREFIX overridden to", zenPathPrefix)
+	}
+	ZenURL = ZenBaseURL + zenPathPrefix + "/v1/chat/completions"
+	ZenModelsURL = ZenBaseURL + zenPathPrefix + "/v1/models"
 
 	return cfg
 }
