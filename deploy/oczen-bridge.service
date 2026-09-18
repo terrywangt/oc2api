@@ -1,0 +1,16 @@
+[Unit]
+Description=oczen-bridge (OpenAI-compatible bridge -> opencode serve)
+After=network.target oczen-serve.service
+Wants=oczen-serve.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/oczen
+ExecStart=/usr/bin/python3 /opt/oczen/oczen-bridge.py --port 8082 --serve http://127.0.0.1:4096
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/oczen-bridge.log
+StandardError=append:/var/log/oczen-bridge.log
+
+[Install]
+WantedBy=multi-user.target

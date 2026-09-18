@@ -1,0 +1,17 @@
+[Unit]
+Description=OpenCode serve (official client, for Zen free-tier bridge)
+After=network.target
+
+[Service]
+Type=simple
+# 干净目录：避免加载外部 plugin（插件会导致 Zen 免费层判定失败）
+WorkingDirectory=/opt/oczen/work
+Environment=OPENCODE_DISABLE_PROJECT_CONFIG=1
+ExecStart=/www/server/nodejs/v24.19.0/bin/opencode serve --port 4096
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/oczen-serve.log
+StandardError=append:/var/log/oczen-serve.log
+
+[Install]
+WantedBy=multi-user.target
