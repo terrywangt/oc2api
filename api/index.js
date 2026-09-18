@@ -5,6 +5,9 @@ const PROXY_VERSION = "v1.7.0";
 // Vercel / Node 走 process.env
 const getEnv = (name) => globalThis.__OC_ENV__?.[name] ?? globalThis.process?.env?.[name];
 const ZEN_BASE_URL = getEnv("ZEN_BASE_URL") || "https://oc.1day.wang";
+// ZEN_API_KEY: 转发给上游(Zen 网关/Go 代理)的鉴权密钥。
+// 直连 opencode.ai 时用 free tier 的 "public"；走自建 Go 代理时填该代理的 API_KEY。
+const ZEN_API_KEY = getEnv("ZEN_API_KEY") || "public";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
@@ -293,7 +296,7 @@ async function fetchZenModels() {
 			method: "GET",
 			headers: {
 				"Accept": "application/json",
-				"Authorization": "Bearer public",
+				"Authorization": `Bearer ${ZEN_API_KEY}`,
 				"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
 			},
 			signal: controller.signal,
@@ -448,7 +451,7 @@ function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEf
 		headers: {
 			"Accept": "text/event-stream",
 			"Content-Type": "application/json",
-			"Authorization": "Bearer public",
+			"Authorization": `Bearer ${ZEN_API_KEY}`,
 			"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
 			"x-opencode-client": "desktop",
 			"x-opencode-project": "global",
