@@ -1,5 +1,5 @@
 const OC_VERSION = "1.18.31";
-const PROXY_VERSION = "v1.6.1";
+const PROXY_VERSION = "v1.7.0";
 
 // 兼容多平台环境变量读取：Cloudflare Worker 通过 __OC_ENV__（env 参数）注入，
 // Vercel / Node 走 process.env
@@ -175,7 +175,9 @@ async function handleOpenAI(request) {
 	const input = await readJson(request);
 	if (input.error) return input.error;
 
-	const { model, messages, stream, tools, tool_choice } = input.body;
+	const { model, messages, stream, tools, tool_choice, max_tokens, max_completion_tokens } = input.body;
+	const reasoningEffort = input.body.reasoning_effort ?? input.body.reasoningEffort;
+	const maxTokens = max_tokens ?? max_completion_tokens;
 
 	const sessionId = getSession(auth.user);
 	const msgSummary = (messages || []).map((msg) => ({
@@ -190,7 +192,8 @@ async function handleOpenAI(request) {
 	const outgoingMessages = upstreamModel === model ? stripImagesForDeepSeek(messages) : messages;
 
 	const transformedMessages = injectReasoningContent(upstreamModel, outgoingMessages);
-	const zenReq = buildZenRequest(upstreamModel, transformedMessages, stream, tools, tool_choice, sessionId);
+	// Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由响应层决定。
+	const zenReq = buildZenRequest(upstreamModel, transformedMessages, true, tools, tool_choice, reasoningEffort, sessionId, maxTokens);
 	logZenRequest(requestId, "openai", model, stream, auth.user, zenReq, messages?.length || 0);
 
 	let upstream;
@@ -202,7 +205,7 @@ async function handleOpenAI(request) {
 	}
 
 	if (stream) return openAIStreamResponse(upstream, requestId, model);
-	return openAIFullResponse(upstream, requestId, model);
+	return openAIFullStreamResponse(upstream, requestId, model);
 }
 
 const IP_PROVIDERS = [
@@ -387,19 +390,63 @@ function injectReasoningContent(model, messages) {
 	return next;
 }
 
-function buildZenRequest(model, messages, stream, tools, toolChoice, sessionId) {
-	const reqBody = { model, messages, stream: !!stream };
+const zenCompatibilityToolDescription = "Compatibility marker only. Do not call or select this function. Use tools explicitly supplied by the user instead.";
+
+function zenCompatibilityTools() {
+	const names = ["bash", "edit", "glob", "grep", "read"];
+	return names.map((name) => ({
+		type: "function",
+		function: {
+			name,
+			description: zenCompatibilityToolDescription,
+			parameters: {
+				type: "object",
+				properties: {},
+			},
+		},
+	}));
+}
+
+function toolFunctionName(tool) {
+	return tool?.function?.name || "";
+}
+
+function appendZenCompatibilityTools(tools) {
+	const result = Array.isArray(tools) ? [...tools] : [];
+	const seen = new Set(result.map(toolFunctionName).filter(Boolean));
+	for (const tool of zenCompatibilityTools()) {
+		const name = toolFunctionName(tool);
+		if (seen.has(name)) continue;
+		result.push(tool);
+		seen.add(name);
+	}
+	return result;
+}
+
+function buildZenRequest(model, messages, stream, tools, toolChoice, reasoningEffort, sessionId, maxTokens) {
+	const hadUserTools = Array.isArray(tools) && tools.length > 0;
+	const reqBody = {
+		model,
+		messages,
+		max_tokens: maxTokens ?? 32000,
+		stream: !!stream,
+		stream_options: { include_usage: true },
+		tools: appendZenCompatibilityTools(tools),
+	};
+	// 没有用户工具时禁止任何工具选择，避免模型选中兼容标记工具。
+	if (!hadUserTools) reqBody.tool_choice = "none";
+	else if (toolChoice != null) reqBody.tool_choice = toolChoice;
+
 	// 按实际发送的模型判断:路由到图片模型时跳过 DS 专属的 reasoning_effort
 	const effort = ["low", "medium", "high", "max"].includes(REASONING_EFFORT) ? REASONING_EFFORT : "high";
 	if (deepSeekRegex.test(model)) {
 		reqBody.reasoning_effort = effort;
 	}
-	if (tools?.length) reqBody.tools = tools;
-	if (toolChoice) reqBody.tool_choice = toolChoice;
 
 	return {
 		body: JSON.stringify(reqBody),
 		headers: {
+			"Accept": "text/event-stream",
 			"Content-Type": "application/json",
 			"Authorization": "Bearer public",
 			"User-Agent": `opencode/${OC_VERSION} ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13`,
@@ -452,6 +499,103 @@ async function openAIFullResponse(upstream, requestId, model) {
 		status: upstream.status,
 		headers: mergeHeaders({ "Content-Type": upstream.headers.get("Content-Type") || "application/json; charset=utf-8" }),
 	});
+}
+
+async function openAIFullStreamResponse(upstream, requestId, model) {
+	const raw = await upstream.text();
+	const zenError = parseZenError(raw);
+	logUpstreamBody(requestId, model, upstream.status, raw, zenError);
+	if (upstream.status >= 400 || zenError) {
+		return openAIErrorResponse(`${zenError?.message || "Rate limit exceeded"} (free model rate limit)`, "rate_limit_error", 429, "rate_limit_exceeded");
+	}
+
+	const normalizer = createOpenAIStreamNormalizer(model);
+	const choices = new Map();
+	let responseId = "";
+	let created;
+	let usage;
+
+	for (const rawLine of raw.split(/\r?\n/)) {
+		const line = rawLine.trimEnd();
+		if (!line.startsWith("data:")) continue;
+		const payload = line.slice(5).trim();
+		if (!payload || payload === "[DONE]") continue;
+
+		const parsed = safeJsonParse(payload);
+		if (!parsed) continue;
+		const normalized = normalizer.normalize(parsed);
+		if (!normalized) continue;
+		if (!responseId && typeof normalized.id === "string") responseId = normalized.id;
+		if (created == null) created = normalized.created;
+		if (normalized.usage != null) usage = normalized.usage;
+
+		if (!Array.isArray(normalized.choices)) continue;
+		for (const choice of normalized.choices) {
+			if (!choice || typeof choice !== "object") continue;
+			const index = Number.isInteger(choice.index) ? choice.index : 0;
+			if (!choices.has(index)) {
+				choices.set(index, {
+					content: "",
+					reasoning: "",
+					role: "",
+					finish: "",
+					toolCalls: new Map(),
+				});
+			}
+			const state = choices.get(index);
+			const delta = choice.delta && typeof choice.delta === "object" ? choice.delta : {};
+			if (typeof delta.role === "string" && delta.role) state.role = delta.role;
+			if (typeof delta.content === "string") state.content += delta.content;
+			if (typeof delta.reasoning_content === "string") state.reasoning += delta.reasoning_content;
+			if (Array.isArray(delta.tool_calls)) {
+				for (const call of delta.tool_calls) {
+					if (!call || typeof call !== "object") continue;
+					const callIndex = Number.isInteger(call.index) ? call.index : state.toolCalls.size;
+					if (!state.toolCalls.has(callIndex)) {
+						state.toolCalls.set(callIndex, { id: "", type: "", name: "", argumentText: "" });
+					}
+					const toolCall = state.toolCalls.get(callIndex);
+					if (typeof call.id === "string" && call.id) toolCall.id = call.id;
+					if (typeof call.type === "string" && call.type) toolCall.type = call.type;
+					const fn = call.function && typeof call.function === "object" ? call.function : {};
+					if (typeof fn.name === "string" && fn.name) toolCall.name = fn.name;
+					const argumentFragment = fn["arguments"];
+					if (typeof argumentFragment === "string") toolCall.argumentText += argumentFragment;
+				}
+			}
+			if (typeof choice.finish_reason === "string" && choice.finish_reason) state.finish = choice.finish_reason;
+		}
+	}
+
+	const resultChoices = [...choices.entries()].sort(([a], [b]) => a - b).map(([index, state]) => {
+		const message = {
+			role: state.role || "assistant",
+			content: state.content,
+		};
+		if (state.reasoning) message.reasoning_content = state.reasoning;
+		if (state.toolCalls.size) {
+			message.tool_calls = [...state.toolCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => ({
+				id: call.id,
+				type: call.type || "function",
+				function: { name: call.name, "arguments": call.argumentText },
+			}));
+		}
+		return {
+			index,
+			message,
+			finish_reason: state.finish || "stop",
+		};
+	});
+
+	const result = {
+		id: responseId || requestId,
+		object: "chat.completion",
+		created: created ?? Math.floor(Date.now() / 1000),
+		model,
+		choices: resultChoices,
+	};
+	if (usage != null) result.usage = usage;
+	return jsonResponse(result, upstream.status);
 }
 
 async function openAIStreamResponse(upstream, requestId, model) {
@@ -572,7 +716,11 @@ function createOpenAIStreamNormalizer(model) {
 
 	return {
 		normalize(chunk) {
-			if (!chunk || !Array.isArray(chunk.choices)) return null;
+			if (!chunk) return null;
+			if (!Array.isArray(chunk.choices)) {
+				if (chunk.usage == null) return null;
+				chunk = { ...chunk, choices: [] };
+			}
 			if (!chunk.choices.length && chunk.cost != null) return null;
 
 			const next = { ...chunk };

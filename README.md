@@ -1,5 +1,7 @@
 # oc2api
 
+> ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，如 `big-pickle`、`mimo-v2.5-free`、`hy3-free` 等。
+
 OpenCode API 代理，支持 SSE 流式响应，可部署到 Vercel / Railway / Render / Cloudflare Worker。
 
 如需本地部署或部署到其他云平台，参见 [server/](./server/) 目录（Go 版）。

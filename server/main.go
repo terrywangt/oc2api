@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	ProxyVersion = "v1.6.1"
+	ProxyVersion = "v1.7.0"
 	// OCVersion 是 UA 中上报的 OpenCode CLI 版本。
 	// 2026-09-17 Zen 给免费层推理端点加了客户端校验(实测, 直连 https://opencode.ai/zen/v1/chat/completions):
 	//   1) UA 必须形如 opencode/<semver> 且版本 >= 1.17.0 —— 低于则 426 UpgradeRequired
@@ -741,11 +742,68 @@ func allTextParts(parts []interface{}) bool {
 	return true
 }
 
-func buildZenRequest(model string, messages, tools []interface{}, toolChoice interface{}, reasoningEffort, sessionId string, stream bool) *zenRequest {
+const zenCompatibilityToolDescription = "Compatibility marker only. Do not call or select this function. Use tools explicitly supplied by the user instead."
+
+func zenCompatibilityTools() []interface{} {
+	// Zen 当前免费层会拒绝没有 OpenCode 核心工具集合的请求。
+	// 描述仅用于降低模型选择它们的概率；用户同名工具不会重复追加。
+	names := []string{"bash", "edit", "glob", "grep", "read"}
+	tools := make([]interface{}, 0, len(names))
+	for _, name := range names {
+		tools = append(tools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        name,
+				"description": zenCompatibilityToolDescription,
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": map[string]interface{}{},
+				},
+			},
+		})
+	}
+	return tools
+}
+
+func toolFunctionName(tool interface{}) string {
+	item, ok := tool.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	function, ok := item["function"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return getString(function["name"], "")
+}
+
+func appendZenCompatibilityTools(tools []interface{}) []interface{} {
+	result := append([]interface{}(nil), tools...)
+	seen := make(map[string]bool, len(result))
+	for _, tool := range result {
+		if name := toolFunctionName(tool); name != "" {
+			seen[name] = true
+		}
+	}
+	for _, tool := range zenCompatibilityTools() {
+		if name := toolFunctionName(tool); !seen[name] {
+			result = append(result, tool)
+			seen[name] = true
+		}
+	}
+	return result
+}
+
+func buildZenRequest(model string, messages, tools []interface{}, toolChoice interface{}, reasoningEffort, sessionId string, stream bool, maxTokens interface{}) *zenRequest {
 	body := map[string]interface{}{
-		"model":    model,
-		"messages": messages,
-		"stream":   stream,
+		"model":          model,
+		"messages":       messages,
+		"max_tokens":     maxTokens,
+		"stream":         stream,
+		"stream_options": map[string]interface{}{"include_usage": true},
+	}
+	if body["max_tokens"] == nil {
+		body["max_tokens"] = 32000
 	}
 	// 按实际发送的模型判断:路由到图片模型时跳过 DS 专属的 reasoning_effort
 	if deepSeekRegex.MatchString(model) {
@@ -754,9 +812,13 @@ func buildZenRequest(model string, messages, tools []interface{}, toolChoice int
 		}
 		body["reasoning_effort"] = reasoningEffort
 	}
-	if len(tools) > 0 {
-		body["tools"] = tools
+	hadUserTools := len(tools) > 0
+	tools = appendZenCompatibilityTools(tools)
+	if !hadUserTools {
+		// 客户端没有真实工具时，禁止任何工具选择，避免选中兼容标记工具。
+		toolChoice = "none"
 	}
+	body["tools"] = tools
 	if toolChoice != nil {
 		body["tool_choice"] = toolChoice
 	}
@@ -774,6 +836,8 @@ func buildZenRequest(model string, messages, tools []interface{}, toolChoice int
 	}
 	if stream {
 		headers["Accept"] = "text/event-stream"
+	} else {
+		headers["Accept"] = "*/*"
 	}
 
 	return &zenRequest{
@@ -954,7 +1018,10 @@ func (n *streamNormalizer) normalize(chunk map[string]interface{}) map[string]in
 
 	choices, ok := chunk["choices"].([]interface{})
 	if !ok {
-		return nil
+		if chunk["usage"] == nil {
+			return nil
+		}
+		choices = []interface{}{}
 	}
 
 	if len(choices) == 0 && chunk["cost"] != nil {
@@ -967,7 +1034,7 @@ func (n *streamNormalizer) normalize(chunk map[string]interface{}) map[string]in
 		next["model"] = n.model
 	}
 
-	var newChoices []interface{}
+	newChoices := make([]interface{}, 0, len(choices))
 	for _, c := range choices {
 		choice, ok := c.(map[string]interface{})
 		if !ok {
@@ -1048,6 +1115,10 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 	}
 	tools, _ := input.Body["tools"].([]interface{})
 	toolChoice := input.Body["tool_choice"]
+	maxTokens := input.Body["max_tokens"]
+	if maxTokens == nil {
+		maxTokens = input.Body["max_completion_tokens"]
+	}
 	reasoningEffort := getString(input.Body["reasoning_effort"], "")
 	if reasoningEffort == "" {
 		reasoningEffort = getString(input.Body["reasoningEffort"], "")
@@ -1073,7 +1144,8 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 	log.Println("[OAI]", time.Now().UTC().Format(time.RFC3339), user, model,
 		map[bool]string{true: "stream", false: "sync"}[stream], "msgs:", msgSummary)
 
-	zenReq := buildZenRequest(upstreamModel, transformedMessages, tools, toolChoice, reasoningEffort, sessionId, stream)
+	// Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由下游响应层决定。
+	zenReq := buildZenRequest(upstreamModel, transformedMessages, tools, toolChoice, reasoningEffort, sessionId, true, maxTokens)
 	logZenRequest(requestId, "openai", model, stream, user, zenReq, len(messages))
 
 	upstream, err := fetchZen(r.Context(), zenReq)
@@ -1097,7 +1169,7 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 		OpenAIStreamResponse(w, r, upstream, requestId, model, env)
 		return
 	}
-	OpenAIFullResponse(w, upstream, requestId, model, env)
+	OpenAIFullStreamResponse(w, upstream, requestId, model, env)
 }
 
 func OpenAIFullResponse(w http.ResponseWriter, upstream *http.Response, requestId, model, env string) {
@@ -1136,6 +1208,216 @@ func OpenAIFullResponse(w http.ResponseWriter, upstream *http.Response, requestI
 	}
 	w.WriteHeader(upstream.StatusCode)
 	w.Write(raw)
+}
+
+func OpenAIFullStreamResponse(w http.ResponseWriter, upstream *http.Response, requestId, model, env string) {
+	if upstream.Body == nil {
+		writeOpenAIError(w, "Empty response from upstream", "upstream_error", http.StatusBadGateway, "")
+		return
+	}
+
+	raw, err := io.ReadAll(upstream.Body)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		writeUpstreamError(w, err)
+		return
+	}
+	// Zen 的 SSE 偶尔在已发送完整内容后直接断开 chunked body；继续解析已收到的帧。
+
+	zenErr := parseZenError(string(raw))
+	logUpstreamBody(env, requestId, model, upstream.StatusCode, string(raw), zenErr, false)
+	if upstream.StatusCode >= 400 || zenErr != nil {
+		msg := "Rate limit exceeded"
+		if zenErr != nil {
+			msg = zenErr.Message
+		}
+		writeOpenAIError(w, msg+" (free model rate limit)", "rate_limit_error", http.StatusTooManyRequests, "rate_limit_exceeded")
+		return
+	}
+
+	type aggregateToolCall struct {
+		id        string
+		typeName  string
+		name      string
+		arguments strings.Builder
+	}
+	type aggregateChoice struct {
+		content   strings.Builder
+		reasoning strings.Builder
+		role      string
+		finish    string
+		toolCalls map[int]*aggregateToolCall
+	}
+
+	normalizer := newStreamNormalizer(model)
+	choices := make(map[int]*aggregateChoice)
+	var responseID string
+	var created interface{}
+	var usage interface{}
+
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(line[5:])
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+
+		var parsed map[string]interface{}
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			continue
+		}
+		normalized := normalizer.normalize(parsed)
+		if normalized == nil {
+			continue
+		}
+		if responseID == "" {
+			responseID = getString(normalized["id"], "")
+		}
+		if created == nil {
+			created = normalized["created"]
+		}
+		if normalized["usage"] != nil {
+			usage = deepCopy(normalized["usage"])
+		}
+
+		items, ok := normalized["choices"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			choice, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			index := getInt(choice["index"], 0)
+			state := choices[index]
+			if state == nil {
+				state = &aggregateChoice{toolCalls: make(map[int]*aggregateToolCall)}
+				choices[index] = state
+			}
+			delta, _ := choice["delta"].(map[string]interface{})
+			if role := getString(delta["role"], ""); role != "" {
+				state.role = role
+			}
+			if content := getString(delta["content"], ""); content != "" {
+				state.content.WriteString(content)
+			}
+			if reasoning := getString(delta["reasoning_content"], ""); reasoning != "" {
+				state.reasoning.WriteString(reasoning)
+			}
+			if calls, ok := delta["tool_calls"].([]interface{}); ok {
+				for _, rawCall := range calls {
+					call, ok := rawCall.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					callIndex := getInt(call["index"], len(state.toolCalls))
+					toolCall := state.toolCalls[callIndex]
+					if toolCall == nil {
+						toolCall = &aggregateToolCall{}
+						state.toolCalls[callIndex] = toolCall
+					}
+					if id := getString(call["id"], ""); id != "" {
+						toolCall.id = id
+					}
+					if typeName := getString(call["type"], ""); typeName != "" {
+						toolCall.typeName = typeName
+					}
+					if function, ok := call["function"].(map[string]interface{}); ok {
+						if name := getString(function["name"], ""); name != "" {
+							toolCall.name = name
+						}
+						if arguments := getString(function["arguments"], ""); arguments != "" {
+							toolCall.arguments.WriteString(arguments)
+						}
+					}
+				}
+			}
+			if finish := getString(choice["finish_reason"], ""); finish != "" {
+				state.finish = finish
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		writeUpstreamError(w, err)
+		return
+	}
+
+	if responseID == "" {
+		responseID = requestId
+	}
+	if created == nil {
+		created = time.Now().Unix()
+	}
+	indexes := make([]int, 0, len(choices))
+	for index := range choices {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	resultChoices := make([]interface{}, 0, len(indexes))
+	for _, index := range indexes {
+		state := choices[index]
+		message := map[string]interface{}{
+			"role":    state.role,
+			"content": state.content.String(),
+		}
+		if message["role"] == "" {
+			message["role"] = "assistant"
+		}
+		if state.reasoning.Len() > 0 {
+			message["reasoning_content"] = state.reasoning.String()
+		}
+		if len(state.toolCalls) > 0 {
+			toolIndexes := make([]int, 0, len(state.toolCalls))
+			for toolIndex := range state.toolCalls {
+				toolIndexes = append(toolIndexes, toolIndex)
+			}
+			sort.Ints(toolIndexes)
+			toolCalls := make([]interface{}, 0, len(toolIndexes))
+			for _, toolIndex := range toolIndexes {
+				toolCall := state.toolCalls[toolIndex]
+				function := map[string]interface{}{
+					"name":      toolCall.name,
+					"arguments": toolCall.arguments.String(),
+				}
+				item := map[string]interface{}{
+					"id":       toolCall.id,
+					"type":     toolCall.typeName,
+					"function": function,
+				}
+				if item["type"] == "" {
+					item["type"] = "function"
+				}
+				toolCalls = append(toolCalls, item)
+			}
+			message["tool_calls"] = toolCalls
+		}
+		finish := state.finish
+		if finish == "" {
+			finish = "stop"
+		}
+		resultChoices = append(resultChoices, map[string]interface{}{
+			"index":         index,
+			"message":       message,
+			"finish_reason": finish,
+		})
+	}
+
+	result := map[string]interface{}{
+		"id":      responseID,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": resultChoices,
+	}
+	if usage != nil {
+		result["usage"] = usage
+	}
+	JSONResponse(w, result, upstream.StatusCode)
 }
 
 func OpenAIStreamResponse(w http.ResponseWriter, r *http.Request, upstream *http.Response, requestId, model, env string) {
