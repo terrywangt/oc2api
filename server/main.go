@@ -39,16 +39,18 @@ const (
 	defaultTimeout     = 5 * time.Minute
 	ImageFallbackModel = "mimo-v2.5-free" // DeepSeek 不支持图片,带图请求路由到该带图模型
 
-	// ZEN_BASE_URL: 覆盖 Zen 上游地址。留空默认 https://opencode.ai。
-	// 设为本地 bridge 地址(如 http://127.0.0.1:8082)可绕过 TLS 指纹门禁。
-	ZenBaseURL string
-	ZenURL     string
-	ZenModelsURL string
-
 	// 图片生成上游:免费、无需 key。OpenCode Zen 免费模型全部只输出文本(text-only),无生图能力,
 	// 因此 /v1/images/generations 转发到 Pollinations 免费图片服务。
 	PollinationsImageURL = "https://image.pollinations.ai/prompt/"
 	PollinationsUA       = "Mozilla/5.0 (compatible; oc2api-image/1.0)"
+)
+
+// ZEN_BASE_URL: 覆盖 Zen 上游地址。留空默认 https://opencode.ai。
+// 设为本地 bridge 地址(如 http://127.0.0.1:8082)可绕过 TLS 指纹门禁。
+var (
+	ZenBaseURL   string
+	ZenURL       string
+	ZenModelsURL string
 )
 
 // imageCacheDir 存放本地暂存的生成图片(response_format=url 时供 GET /images/{id} 取用)
