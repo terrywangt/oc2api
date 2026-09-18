@@ -4,7 +4,7 @@ const PROXY_VERSION = "v1.6.1";
 // 兼容多平台环境变量读取：Cloudflare Worker 通过 __OC_ENV__（env 参数）注入，
 // Vercel / Node 走 process.env
 const getEnv = (name) => globalThis.__OC_ENV__?.[name] ?? globalThis.process?.env?.[name];
-const ZEN_BASE_URL = getEnv("ZEN_BASE_URL") || "https://opencode.ai";
+const ZEN_BASE_URL = getEnv("ZEN_BASE_URL") || "https://oc.1day.wang";
 const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
 const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
