@@ -8,8 +8,11 @@ const ZEN_BASE_URL = getEnv("ZEN_BASE_URL") || "https://oc.1day.wang";
 // ZEN_API_KEY: 转发给上游(Zen 网关/Go 代理)的鉴权密钥。
 // 直连 opencode.ai 时用 free tier 的 "public"；走自建 Go 代理时填该代理的 API_KEY。
 const ZEN_API_KEY = getEnv("ZEN_API_KEY") || "public";
-const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
-const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
+// ZEN_PATH_PREFIX: Zen 官方端点在 /zen/v1/...；自建 Go 代理直接暴露 /v1/...。
+// 默认按直连 opencode.ai 处理；指向自建代理时设 ZEN_PATH_PREFIX=""。
+const ZEN_PATH_PREFIX = getEnv("ZEN_PATH_PREFIX") ?? "/zen";
+const ZEN_URL = `${ZEN_BASE_URL}${ZEN_PATH_PREFIX}/v1/chat/completions`;
+const ZEN_MODELS_URL = `${ZEN_BASE_URL}${ZEN_PATH_PREFIX}/v1/models`;
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
 const IMAGE_FALLBACK_MODEL = "mimo-v2.5-free"; // DeepSeek 不支持图片,带图请求路由到该带图模型
 
