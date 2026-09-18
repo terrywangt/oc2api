@@ -147,7 +147,7 @@ def main():
     a = ap.parse_args()
     SERVE = a.serve.rstrip("/")
     from http.server import ThreadingHTTPServer
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), handle(None))
+    srv = ThreadingHTTPServer(("0.0.0.0", a.port), handle(None))
     print(f"bridge listening on http://127.0.0.1:{a.port} -> {SERVE}", flush=True)
     srv.serve_forever()
 
